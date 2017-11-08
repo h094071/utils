@@ -1,0 +1,14 @@
+*.pyc
+.settings/org.eclipse.core.resources.prefs
+.pydevproject
+.swp
+.DS_Store
+.project
+.idea/*
+.idea/
+*~
+_amds/
+_ignored/
+_ignored_menduo/
+_amds
+.vscode/
