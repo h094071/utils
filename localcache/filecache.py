@@ -4,36 +4,20 @@
 用本地文件做数据缓存装饰器（被装饰的函数参数不能是不可序列化的对象）
 """
 import os
-import json
+import pickle
 import time
 import logging
 import hashlib
+import six
+import sys
 from functools import wraps
-from lib.utils import force_utf8
-
-
-def key_to_int(data):
-    """
-    字典的key转换成int
-    :param data:
-    :return:
-    """
-    if isinstance(data, dict):
-        tmp_dict = {}
-        for k, v in data.iteritems():
-            try:
-                tmp_dict.update({int(k): key_to_int(v)})
-            except ValueError:
-                tmp_dict.update({k: key_to_int(v)})
-        return tmp_dict
-    return data
 
 
 class FileCache(object):
     """
     用本地文件做数据缓存
     """
-    FILE_NAME_LIST = []
+    FILE_NAME_LOCK_LIST = []
 
     def __init__(self, key, expire=86400, retry_count=50, interval=1.0):
         """
@@ -49,76 +33,74 @@ class FileCache(object):
         self.retry_count = retry_count
         self.interval = interval
         self.key = key
-        filename = key + ".json"
+        self.path = "/data/tmp/filecache/"
+        filename = key + ".data"
         self.filename = filename
-        if not os.path.exists("/data/tmp"):
-            os.mkdir("/data/tmp")
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
 
     def __call__(self, func):
         """
-        文件缓冲
-        :param args:
-        :param kwargs:
+        文件缓存
+        :param function func: 被装饰的函数
         :return:
         """
-
-        for i in xrange(self.retry_count):
-            if self.filename in self.FILE_NAME_LIST:
-                time.sleep(self.interval)
-                logging.debug("cache file [%s] is using, operate file error", self.filename)
-            else:
-                logging.debug("cache file [%s] get succ", self.filename)
-                can_use = True
-
-        if not can_use:
-            raise RuntimeError("cache file [%s] is using, operate file error" % self.filename)
-
         @wraps(func)
         def wrap_func(*args, **kwargs):
-            self.FILE_NAME_LIST.append(self.filename)
+            # 获得锁
+            can_use = False
+            for i in xrange(self.retry_count):
+                if self.filename in self.FILE_NAME_LOCK_LIST:
+                    time.sleep(self.interval)
+                    logging.debug("cache file [%s] is using, operate file error", self.filename)
+                else:
+                    logging.debug("cache file [%s] get succ", self.filename)
+                    self.FILE_NAME_LOCK_LIST.append(self.filename)
+                    can_use = True
+                    break
+
+            if not can_use:
+                raise RuntimeError("cache file [%s] is using, operate file error" % self.filename)
+
+            file_name = self.path + self.filename
+            cache_dict = {}
 
             try:
-                file_name = "/data/tmp/" + self.filename
-                data_str = "{}"
-                if kwargs.get("clear_cache"):
-                    kwargs.pop("clear_cache")
-                else:
-                    # 不清除缓存时，读缓存
-                    if os.path.exists(file_name):
-                        with open(file_name, "r") as f:
-                                data_str = f.read()
-                cache_dict = json.loads(data_str)
-                cache_params_str = cache_dict.get("param_str", "")
-                param_str = self._gen_param_str(args, kwargs)
+                # 不清除缓存时，读缓存
+                if os.path.exists(file_name):
+                    with open(file_name, "r") as f:
+                        cache_dict = pickle.load(f)
 
-                # 函数参数相同并且在有效期内，缓冲可以使用。否则使用函数，缓冲结果
+                cache_params_str = cache_dict.get("param_str", "")
+                param_str = self._gen_param_str(*args, **kwargs)
+
+                # 函数参数相同并且在有效期内，缓存可以使用。否则使用函数，缓存结果
                 if cache_params_str == param_str and time.time() - int(cache_dict["time_stamp"]) < self.expire:
                     cache_data = cache_dict["data"]
-                    cache_data = force_utf8(cache_data)
-                    cache_data = key_to_int(cache_data)
                     result = cache_data
+
                 else:
                     result = func(*args, **kwargs)
 
-                # 写缓冲
-                with open(file_name, "w") as f:
+                    # 写缓存
+                    with open(file_name, "w") as f:
                         cache_dict = {
                             "key": self.key,
                             "param_str": param_str,
                             "time_stamp": time.time(),
                             "data": result
                         }
-                        f.write(json.dumps(cache_dict))
-            except Exception as e:
-                self.FILE_NAME_LIST.remove(self.filename)
-                raise e
+                        pickle.dump(cache_dict, f)
+            except Exception:
+                six.reraise(*sys.exc_info())
+            finally:
+                self.FILE_NAME_LOCK_LIST.remove(self.filename)
 
-            self.FILE_NAME_LIST.remove(self.filename)
             return result
 
         return wrap_func
 
-    def _gen_param_str(self, args, kwargs):
+    def _gen_param_str(self, *args, **kwargs):
         """
         生成函数参数指纹
         :param list args: 位置参数列表
@@ -137,18 +119,20 @@ class FileCache(object):
         清除cache
         :return: None
         """
-        file_name = "/data/tmp/" + self.filename
-        self.FILE_NAME_LIST.append(self.filename)
+        file_name = self.path + self.filename
+        self.FILE_NAME_LOCK_LIST.append(self.filename)
 
         with open(file_name, "w") as file:
             file.write("{}")
 
-        self.FILE_NAME_LIST.remove(self.filename)
+        self.FILE_NAME_LOCK_LIST.remove(self.filename)
+
 
 if __name__ == "__main__":
     @FileCache("add")
     def add(a, b):
         print "no cache"
         return a + b
+
 
     c = add(1, 2)
