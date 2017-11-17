@@ -1,8 +1,9 @@
 #!/usr/bin/env
 # -*- coding: utf-8 -*-
 """
-用本地文件做数据缓存装饰器（被装饰的函数参数不能是不可序列化的对象）
+用本地文件做数据缓存装饰器（被装饰的函数参数以及返回结果必须可序列化的对象）
 """
+import fcntl
 import os
 import pickle
 import time
@@ -19,25 +20,24 @@ class FileCache(object):
     """
     FILE_NAME_LOCK_LIST = []
 
-    def __init__(self, key, expire=86400, retry_count=50, interval=1.0):
+    def __init__(self, path, expire=86400):
         """
         初始化
         :param int expire: 失效时间, 分
-        :param str key: 指定键值
-        :param int start: 从开始计算的参数下标
-        :param int retry_count: 重试次数
-        :param float interval: 重试间隔, 单位: 秒
+        :param str path: 缓存文件路径
         :return: 装饰器
         """
         self.expire = expire
-        self.retry_count = retry_count
-        self.interval = interval
-        self.key = key
-        self.path = "/data/tmp/filecache/"
-        filename = key + ".data"
-        self.filename = filename
+        self.root = "/data/tmp/filecache/"
+        self.path = os.path.join(self.root, path)
+        dir = os.path.dirname(self.path)
+        # 创建目录
+        if not os.path.exists(dir):
+            os.makedirs(dir)
+        # 创建文件
         if not os.path.exists(self.path):
-            os.makedirs(self.path)
+            with open(self.path, "w"):
+                pass
 
     def __call__(self, func):
         """
@@ -45,58 +45,58 @@ class FileCache(object):
         :param function func: 被装饰的函数
         :return:
         """
+
         @wraps(func)
         def wrap_func(*args, **kwargs):
-            # 获得锁
-            can_use = False
-            for i in xrange(self.retry_count):
-                if self.filename in self.FILE_NAME_LOCK_LIST:
-                    time.sleep(self.interval)
-                    logging.debug("cache file [%s] is using, operate file error", self.filename)
-                else:
-                    logging.debug("cache file [%s] get succ", self.filename)
-                    self.FILE_NAME_LOCK_LIST.append(self.filename)
-                    can_use = True
-                    break
 
-            if not can_use:
-                raise RuntimeError("cache file [%s] is using, operate file error" % self.filename)
+            # 获得读锁
+            with open(self.path, "r") as file:
+                fd = file.fileno()
+                fcntl.lockf(fd, fcntl.LOCK_SH)
+                try:
+                    cache_dict = pickle.load(file)
+                except Exception:
+                    cache_dict = {}
+            cache_dict = cache_dict if cache_dict else {}
 
-            file_name = self.path + self.filename
-            cache_dict = {}
+            cache_params_str = cache_dict.get("param_str", "")
+            param_str = self._gen_param_str(*args, **kwargs)
 
-            try:
-                # 不清除缓存时，读缓存
-                if os.path.exists(file_name):
-                    with open(file_name, "r") as f:
-                        cache_dict = pickle.load(f)
+            # 判断缓存是否可用
+            if cache_params_str == param_str and time.time() - int(cache_dict["time_stamp"]) < self.expire:
+                cache_data = cache_dict["data"]
+                result = cache_data
+                return result
+            else:
+                # 获得写锁
+                with open(self.path, "r+") as file:
+                    fd = file.fileno()
+                    fcntl.lockf(fd, fcntl.LOCK_EX)
+                    # 获得写锁，查看文件是否已经变更（查看在进程阻塞获得锁的过程中缓存文件是否更新）
+                    try:
+                        cache_dict = pickle.load(file)
+                    except Exception:
+                        cache_dict = {}
+                    cache_dict = cache_dict if cache_dict else {}
+                    cache_params_str = cache_dict.get("param_str", "")
 
-                cache_params_str = cache_dict.get("param_str", "")
-                param_str = self._gen_param_str(*args, **kwargs)
-
-                # 函数参数相同并且在有效期内，缓存可以使用。否则使用函数，缓存结果
-                if cache_params_str == param_str and time.time() - int(cache_dict["time_stamp"]) < self.expire:
-                    cache_data = cache_dict["data"]
-                    result = cache_data
-
-                else:
-                    result = func(*args, **kwargs)
-
-                    # 写缓存
-                    with open(file_name, "w") as f:
+                    # 判断缓存是否可用
+                    if cache_params_str == param_str and time.time() - int(cache_dict["time_stamp"]) < self.expire:
+                        cache_data = cache_dict["data"]
+                        result = cache_data
+                        return result
+                    else:
+                        result = func(*args, **kwargs)
+                        # 写文件
                         cache_dict = {
-                            "key": self.key,
                             "param_str": param_str,
                             "time_stamp": time.time(),
                             "data": result
                         }
-                        pickle.dump(cache_dict, f)
-            except Exception:
-                six.reraise(*sys.exc_info())
-            finally:
-                self.FILE_NAME_LOCK_LIST.remove(self.filename)
-
-            return result
+                        file.seek(0, os.SEEK_SET)
+                        pickle.dump(cache_dict, file)
+                        file.flush()  # 强制写回到文件
+                        return result
 
         return wrap_func
 
@@ -109,30 +109,35 @@ class FileCache(object):
         """
         args = args[1:]
         code = hashlib.md5()
-        code.update(str(self.key))
         code.update("".join(sorted([str(i) for i in args])))
-        code.update("".join(sorted([str(i) for i in kwargs.iteritems()])))
-        return code.hexdigest()
+        code.update("".join(sorted([str(i) for i in kwargs.items()])))
+        res = code.hexdigest()
+        return res
 
     def clear_cache(self):
         """
         清除cache
         :return: None
         """
-        file_name = self.path + self.filename
-        self.FILE_NAME_LOCK_LIST.append(self.filename)
-
-        with open(file_name, "w") as file:
-            file.write("{}")
-
-        self.FILE_NAME_LOCK_LIST.remove(self.filename)
+        with open(self.path, "w") as file:
+            fd = file.fileno
+            fcntl.fcntl(fd, fcntl.LOCK_EX)
+            file.write("")
 
 
 if __name__ == "__main__":
-    @FileCache("add")
+    @FileCache("tmp/add.txt")
     def add(a, b):
-        print "no cache"
+        print ("no cache")
+        time.sleep(1)
         return a + b
 
 
-    c = add(1, 2)
+    from multiprocessing import Process
+
+    for i in range(5):
+        print (" params %s" % i)
+        for _ in range(10):
+            p = Process(target=add, args=(1, i))
+            p.start()
+            p.join()
