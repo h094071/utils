@@ -153,7 +153,7 @@ class EtcdWatch(Singleton):
             res = True
         else:
             if read_res.value != LOCK:
-                res = self._lock(key, read_res.etcd_index)
+                res = self._lock(key, read_res.modifiedIndex)
 
         if res:
             future = Future()
