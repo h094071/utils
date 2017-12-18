@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-常量定义
+etcd 异步 服务发现 异步 锁
 """
 import os
 import sys
@@ -15,15 +15,8 @@ from tornado import gen
 from tornado.concurrent import Future
 from singleton import Singleton
 
-ETCD_SERVERS = (("127.0.0.1", 2379),)
-
-LOCK = "1"
-UNLOCK = "0"
-
-LOCK_FAIL = -1
-
-LOCK_SUCC = 1
-WAIT_LOCK = 2
+LOCK = 1
+UNLOCK = 0
 
 
 class EtcdWatch(Singleton):
@@ -144,7 +137,7 @@ class EtcdWatch(Singleton):
         :param str key: 关键字
         :return: Future object
         """
-        lock_status = LOCK_SUCC
+        res = False
         try:
             read_res = self.client.read(key)
             logging.error(read_res)
@@ -152,22 +145,19 @@ class EtcdWatch(Singleton):
             logging.error("初始化，加锁 start2")
             self.client.set(key, LOCK)
             logging.error("初始化，加锁")
-            lock_status = LOCK_FAIL
+            res = True
         except Exception:
             logging.error("初始化锁失败")
             if self.sentry:
                 self.sentry.captureException(exc_info=True)
-            lock_status = LOCK_FAIL
+            res = True
         else:
             if read_res.value != LOCK:
-                lock_status = self._lock(key, read_res.etcd_index)
+                res = self._lock(key, read_res.etcd_index)
 
-        future = Future()
-        if lock_status == LOCK_SUCC:
+        if res:
+            future = Future()
             future.set_result(LOCK)
-            return future
-        elif lock_status == LOCK_FAIL:
-            future.set_result(LOCK_FAIL)
             return future
 
         return self._get_key(key, is_lock=True)
@@ -196,30 +186,31 @@ class EtcdWatch(Singleton):
             return True
 
 
-etcd_watch = EtcdWatch("/watch", ETCD_SERVERS, None)
+if __name__ == "__main__":
+    ETCD_SERVERS = (("127.0.0.1", 2379),)
+    etcd_watch = EtcdWatch("/watch", ETCD_SERVERS, None)
 
 
-@gen.coroutine
-def test():
-    # print "start"
-    # res = yield etcd_watch.get("/watch/a")
-    # print res
-    # res = yield etcd_watch.get("/watch/aa")
-    # print res
-    # res = yield etcd_watch.get("/watch/aaa")
-    # print res
-    # print "======"
-    # a = "hello"
-    # a += "q"
-    res = yield etcd_watch.lock("/watch/lock/a")
-    print res
-    print "111222222"
-    import time
-    time.sleep(10)
-    raise ValueError("test")
-    res = etcd_watch.unlock("/watch/lock/a")
-    res = "success"
-    raise gen.Return(res)
+    @gen.coroutine
+    def test():
+        # print "start"
+        # res = yield etcd_watch.get("/watch/a")
+        # print res
+        # res = yield etcd_watch.get("/watch/aa")
+        # print res
+        # res = yield etcd_watch.get("/watch/aaa")
+        # print res
+        # print "======"
+        # a = "hello"
+        # a += "q"
+        res = yield etcd_watch.lock("/watch/lock/a")
+        print res
+        print "111222222"
+        import time
+        time.sleep(10)
+        res = etcd_watch.unlock("/watch/lock/a")
+        res = "success"
+        raise gen.Return(res)
 
 
-IOLoop.current().run_sync(test)
+    IOLoop.current().run_sync(test)
