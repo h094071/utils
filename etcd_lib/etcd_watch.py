@@ -5,6 +5,8 @@ etcd 异步 服务发现 异步 锁
 """
 import os
 import sys
+import uuid
+from collections import namedtuple, defaultdict
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 import etcd
@@ -16,13 +18,14 @@ from tornado.concurrent import Future
 from singleton import Singleton
 
 LOCK = 1
-UNLOCK = 0
+UNLOCK = "no_lock"
 
 
 class EtcdWatch(Singleton):
     """
     etcd 异步获得key的更新
     """
+    Lock_Item = namedtuple("Lock_Item", ("future", "token", "ttl"))
 
     def __init__(self, watch_dir, etcd_servers, sentry=None):
         """
@@ -30,10 +33,16 @@ class EtcdWatch(Singleton):
         :param str key: 监控的关键字
         :param tuple etcd_servers: etcd 服务器列表
         """
+        """
+        /watch/aa/aaa/aa 123
+        /watch/aa/bb/b a
+        """
         self.watch_dir = watch_dir
         self.etcd_servers = etcd_servers
         self.sentry = sentry
-        self.key_dict = dict()
+        self.watch_dict = defaultdict(list)
+        self.lock_dict = defaultdict(list)
+        self.locked_dict = dict()
         self.thread = None
         self.client = etcd.Client(host=self.etcd_servers, allow_reconnect=True)
 
@@ -46,23 +55,36 @@ class EtcdWatch(Singleton):
                 for res in self.client.eternal_watch(self.watch_dir, recursive=True):
                     logging.error("获得新的 etcd %s", res)
                     etcd_key = res.key
-                    if etcd_key in self.key_dict.keys():
-                        future, is_lock = self.key_dict[etcd_key]
+                    etcd_value = res.value
+                    print res.value
 
-                        if is_lock:
-                            # 处于解锁状态
-                            if res.value != LOCK:
-                                logging.error(res.value != LOCK)
-                                logging.error(res.value)
-                                lock_flag = self._lock(etcd_key, res.modifiedIndex)
-                                if not lock_flag:
-                                    continue
-                            else:
-                                # 处于加锁状态
-                                continue
+                    # watch key
+                    if etcd_key in self.watch_dict.keys():
+                        future_list = self.watch_dict[etcd_key]
 
-                        future.set_result(res.value)
-                        del self.key_dict[etcd_key]
+                        # 唤醒所有等待的watch
+                        for future in future_list:
+                            future.set_result(etcd_value)
+                        del self.watch_dict[etcd_key]
+
+                    # lock key
+                    elif etcd_key in self.lock_dict.keys():
+                        lock_item_list = self.lock_dict[etcd_key]
+
+                        # 解锁状态
+                        if etcd_value == UNLOCK:
+                            lock_item = lock_item_list[0]
+                            lock_flag = self._lock(etcd_key, lock_item.token, lock_item.ttl)
+                            if lock_flag:
+                                lock_item.future.set_result(lock_item.token)
+                                self.locked_dict[etcd_key] = lock_item
+                                self.lock_dict[etcd_key].pop()
+
+                        elif not etcd_value:
+                            if res.__prev_node.value == self.locked_dict[etcd_key].token:
+                                ttl = self.locked_dict[etcd_key].ttl
+                                del self.locked_dict[etcd_key]
+                                raise RuntimeError("锁时间 %s，锁超时" % ttl)
 
             except Exception as exp:
                 logging.error("thread error: %s", str(exp))
@@ -81,88 +103,55 @@ class EtcdWatch(Singleton):
             t.start()
             logging.error("start thread")
 
-    def _lock(self, key, etcd_index):
+    def _lock(self, key, token, ttl):
         """
 
         :param str key: 关键字
-        :param int etcd_index: 索引
+        :param str lock_uuid: lock码
         :return: bool
         """
         try:
-            logging.error("加锁 start1")
-            set_res = self.client.test_and_set(key, LOCK, UNLOCK)
-            logging.error("加锁")
-        except etcd.EtcdCompareFailed:
-            logging.error("加锁失败")
-            return False
-        except Exception:
-            logging.error("加锁失败")
-            if self.sentry:
-                self.sentry.captureException(exc_info=True)
-            return False
-
-        if set_res._prev_node.modifiedIndex != etcd_index:
-
-            logging.error("加锁失败, 索引不同")
-            logging.error(set_res)
-            return False
-        else:
+            self.client.test_and_set(key, token, UNLOCK)
+            logging.error("def _lock 加锁")
             return True
 
-    def _get_key(self, key, is_lock=False):
-        """
-        异步获得key的值
-        :param str key: 关键字
-        :param bool is_lock: 是否是锁
-        :return: Future object
-        """
-        self._start_thread()
-        if key not in self.key_dict.keys():
-            future = Future()
-            self.key_dict[key] = (future, is_lock)
+        except etcd.EtcdKeyNotFound:
+            try:
+                self.client.write(key, token, prevExist=False, recursive=True, ttl=ttl)
+                return True
+            except etcd.EtcdAlreadyExist:
+                logging.debug("had lock")
+                return False
 
-        return self.key_dict[key][0]
+        except etcd.EtcdCompareFailed:
+            logging.error("EtcdCompareFailed 加锁失败")
+            return False
 
     def watch(self, key):
-        """
-        监控关键字变化
-        :param str key: 关键字
-        :return: Future object
-        """
-        return self._get_key(key)
+        self._start_thread()
+        future = Future()
+        self.watch_dict[key].append(future)
+        return future
 
-    def lock(self, key):
+    def lock(self, key, ttl=0):
         """
         加锁
         :param str key: 关键字
         :return: Future object
         """
-        res = False
-        try:
-            read_res = self.client.read(key)
-            logging.error(read_res)
-        except etcd.EtcdKeyNotFound:
-            logging.error("初始化，加锁 start2")
-            self.client.set(key, LOCK)
-            logging.error("初始化，加锁")
-            res = True
-        except Exception:
-            logging.error("初始化锁失败")
-            if self.sentry:
-                self.sentry.captureException(exc_info=True)
-            res = True
+        self._start_thread()
+        future = Future()
+        token = str(uuid.uuid4())
+        lock_item = self.Lock_Item(future, token, ttl)
+        lock_flag = self._lock(key, token, ttl)
+        if lock_flag:
+            self.locked_dict[key] = lock_item
+            future.set_result(token)
         else:
-            if read_res.value != LOCK:
-                res = self._lock(key, read_res.modifiedIndex)
+            self.lock_dict[key].append(lock_item)
+        return future
 
-        if res:
-            future = Future()
-            future.set_result(LOCK)
-            return future
-
-        return self._get_key(key, is_lock=True)
-
-    def unlock(self, key):
+    def unlock(self, key, token):
         """
         解锁
         :param key:
@@ -170,20 +159,15 @@ class EtcdWatch(Singleton):
         """
         try:
             logging.error("解锁 start")
-            self.client.test_and_set(key, UNLOCK, LOCK)
-            logging.error("解锁")
+            res = self.client.test_and_set(key, UNLOCK, token)
 
+            logging.error(res)
+            logging.error("解锁 %s", token)
+            return True
         except etcd.EtcdCompareFailed:
             logging.error("在未加锁的情况下，进行解锁操作")
             logging.error("unlock")
             return False
-        except Exception:
-            logging.error("解锁失败")
-            if self.sentry:
-                self.sentry.captureException(exc_info=True)
-            return False
-        else:
-            return True
 
 
 if __name__ == "__main__":
@@ -196,19 +180,19 @@ if __name__ == "__main__":
         # print "start"
         # res = yield etcd_watch.get("/watch/a")
         # print res
-        # res = yield etcd_watch.get("/watch/aa")
+        # res = yield etcd_watch.watch("/watch/aa")
         # print res
         # res = yield etcd_watch.get("/watch/aaa")
         # print res
         # print "======"
         # a = "hello"
         # a += "q"
-        res = yield etcd_watch.lock("/watch/lock/a")
-        print res
+        token = yield etcd_watch.lock("/watch/lock/a")
+        print token
         print "111222222"
         import time
-        time.sleep(10)
-        res = etcd_watch.unlock("/watch/lock/a")
+        time.sleep(5)
+        res = etcd_watch.unlock("/watch/lock/a", token)
         res = "success"
         raise gen.Return(res)
 
