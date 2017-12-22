@@ -46,44 +46,52 @@ class EtcdWatchBase(Singleton):
         """
         while True:
             try:
+                res = self.client.get(self.watch_root)
+                print "11111"
+                self.process_etcd(res)
                 for res in self.client.eternal_watch(self.watch_root, recursive=True):
-                    logging.error("获得新的 etcd %s", res)
-                    etcd_key = res.key
-                    etcd_value = res.value
-
-                    # watch key
-                    if etcd_key in self.watch_dict.keys():
-                        future_list = self.watch_dict[etcd_key]
-
-                        # 唤醒所有等待的watch
-                        for future in future_list:
-                            future.set_result((True, etcd_value))
-                        del self.watch_dict[etcd_key]
-
-                    # lock key
-                    elif etcd_key in self.wait_lock_dict:
-                        wait_lock_list = self.wait_lock_dict[etcd_key]
-
-                        # 解锁状态 或者 锁超时 进行解锁操作
-                        if etcd_value in (self.UNLOCK, None) and len(wait_lock_list):
-                            lock_item = wait_lock_list[0]
-                            lock_flag = self._lock(etcd_key, lock_item.token, lock_item.ttl)
-                            if lock_flag:
-                                lock_item.future.set_result((True, lock_item.token))
-                                self.locked_dict[etcd_key] = lock_item
-                                self.wait_lock_dict[etcd_key].pop(0)
-
-                        # 锁超时
-                        elif not etcd_value:
-                            if self.locked_dict.get(etcd_key):
-                                ttl = self.locked_dict[etcd_key].ttl
-                                del self.locked_dict[etcd_key]
-                                raise RuntimeError("key: %s ttl: %s，锁超时" % (etcd_key, ttl))
+                    logging.error("获得新的 etcd")
+                    self.process_etcd(res)
 
             except Exception as exp:
                 logging.error("thread error: %s", str(exp))
                 if self.sentry:
                     self.sentry.captureException(exc_info=True)
+
+    def process_etcd(self, res):
+        etcd_key = res.key
+        etcd_value = res.value
+
+        # watch key
+        print "wait key"
+        if etcd_key in self.watch_dict.keys():
+            future_list = self.watch_dict[etcd_key]
+
+            # 唤醒所有等待的watch
+            for future in future_list:
+                future.set_result((True, etcd_value))
+            del self.watch_dict[etcd_key]
+
+        # lock key
+        elif etcd_key in self.wait_lock_dict:
+            wait_lock_list = self.wait_lock_dict[etcd_key]
+
+            # 解锁状态 或者 锁超时 进行解锁操作
+            if etcd_value in (self.UNLOCK, None) and wait_lock_list:
+                lock_item = wait_lock_list[0]
+                logging.error("watch lock")
+                lock_flag = self._lock(etcd_key, lock_item.token, lock_item.ttl)
+                if lock_flag:
+                    lock_item.future.set_result((True, lock_item.token))
+                    self.locked_dict[etcd_key] = lock_item
+                    self.wait_lock_dict[etcd_key].pop(0)
+
+            # 锁超时
+            elif not etcd_value:
+                if self.locked_dict.get(etcd_key):
+                    ttl = self.locked_dict[etcd_key].ttl
+                    del self.locked_dict[etcd_key]
+                    raise RuntimeError("key: %s ttl: %s，锁超时" % (etcd_key, ttl))
 
     def _start_thread(self):
         """
@@ -111,14 +119,15 @@ class EtcdWatchBase(Singleton):
 
         except etcd.EtcdKeyNotFound:
             try:
-                self.client.write(key, token, prevExist=False, ttl=ttl)
+                self.client.write(key, token, prevExist=False, recursive=True, ttl=ttl)
+                logging.debug("write")
                 return True
-            except etcd.EtcdAlreadyExist:
-                logging.debug("had lock")
+            except etcd.EtcdAlreadyExist as e:
+                logging.debug("had lock %s", e)
                 return False
 
-        except etcd.EtcdCompareFailed:
-            logging.error("EtcdCompareFailed 加锁失败")
+        except etcd.EtcdCompareFailed as e:
+            logging.error("EtcdCompareFailed: %s 加锁失败", e)
             return False
 
     def watch(self, key):
@@ -138,7 +147,7 @@ class EtcdWatchBase(Singleton):
         self.watch_dict[key].append(future)
         return future
 
-    def lock(self, key, ttl=0):
+    def lock(self, key, ttl=None):
         """
         加锁
         :param str key: 关键字
@@ -170,15 +179,12 @@ class EtcdWatchBase(Singleton):
         :return:
         """
         try:
-            logging.error("解锁 start")
-            res = self.client.test_and_set(key, self.UNLOCK, token)
-
-            logging.error(res)
+            self.client.test_and_set(key, self.UNLOCK, token)
             logging.error("解锁 %s", token)
             return True
-        except etcd.EtcdCompareFailed, etcd.EtcdKeyNotFound:
+        except (etcd.EtcdCompareFailed, etcd.EtcdKeyNotFound) as e:
             logging.error("在未加锁的情况下，进行解锁操作")
-            logging.error("unlock")
+            logging.error(e)
             return False
 
 
@@ -199,14 +205,49 @@ if __name__ == "__main__":
         # print "======"
         # a = "hello"
         # a += "q"
-        token = yield etcd_watch.lock("/watch/lock/a")
-        print token
-        print "111222222"
         import time
-        time.sleep(5)
-        res = etcd_watch.unlock("/watch/lock/a", token)
-        res = "success"
+        start_time = time.time()
+        flag, token = yield etcd_watch.lock("/watch/lock/aa1")
+        print flag, token
+
+        def tmp():
+            f = Future()
+            IOLoop.current().call_later(1, lambda: f.set_result(None))
+            return f
+
+        yield tmp()
+        res = etcd_watch.unlock("/watch/lock/aa1", token)
+        print "执行时间："
+        print time.time() - start_time
         raise gen.Return(res)
 
 
-    IOLoop.current().run_sync(test)
+    io_loop = IOLoop.instance()
+    future_list = []
+    for i in range(10):
+        future = test()
+        future_list.append(future)
+
+
+        def stop(future):
+            future_list.remove(future)
+
+            if not future_list:
+                io_loop.stop()
+
+
+        io_loop.add_future(future, lambda x: stop(x))
+    io_loop.start()
+
+
+    # IOLoop.current().run_sync(test)
+    # def main():
+    #     IOLoop.current().run_sync(test)
+    #
+    #
+    # from multiprocessing import Process
+    #
+    # for _ in range(2):
+    #     p = Process(target=main)
+    #     p.daemon = False
+    #     p.start()
