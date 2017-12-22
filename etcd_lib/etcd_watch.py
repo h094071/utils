@@ -17,14 +17,13 @@ from tornado import gen
 from tornado.concurrent import Future
 from singleton import Singleton
 
-UNLOCK = "no_lock"
 
-
-class EtcdWatch(Singleton):
+class EtcdWatchBase(Singleton):
     """
     etcd 异步获得key的更新
     """
     Lock_Item = namedtuple("Lock_Item", ("future", "token", "ttl"))
+    UNLOCK = "no_lock"
 
     def __init__(self, watch_root, etcd_servers, sentry=None):
         """
@@ -58,7 +57,7 @@ class EtcdWatch(Singleton):
 
                         # 唤醒所有等待的watch
                         for future in future_list:
-                            future.set_result(etcd_value)
+                            future.set_result((True, etcd_value))
                         del self.watch_dict[etcd_key]
 
                     # lock key
@@ -66,11 +65,11 @@ class EtcdWatch(Singleton):
                         wait_lock_list = self.wait_lock_dict[etcd_key]
 
                         # 解锁状态 或者 锁超时 进行解锁操作
-                        if etcd_value in (UNLOCK, None) and len(wait_lock_list):
+                        if etcd_value in (self.UNLOCK, None) and len(wait_lock_list):
                             lock_item = wait_lock_list[0]
                             lock_flag = self._lock(etcd_key, lock_item.token, lock_item.ttl)
                             if lock_flag:
-                                lock_item.future.set_result(lock_item.token)
+                                lock_item.future.set_result((True, lock_item.token))
                                 self.locked_dict[etcd_key] = lock_item
                                 self.wait_lock_dict[etcd_key].pop(0)
 
@@ -80,9 +79,6 @@ class EtcdWatch(Singleton):
                                 ttl = self.locked_dict[etcd_key].ttl
                                 del self.locked_dict[etcd_key]
                                 raise RuntimeError("key: %s ttl: %s，锁超时" % (etcd_key, ttl))
-                            else:
-                                raise RuntimeError("key: %s 锁异常" % (etcd_key))
-
 
             except Exception as exp:
                 logging.error("thread error: %s", str(exp))
@@ -109,7 +105,7 @@ class EtcdWatch(Singleton):
         :return: bool
         """
         try:
-            self.client.test_and_set(key, token, UNLOCK, ttl)
+            self.client.test_and_set(key, token, self.UNLOCK, ttl)
             logging.error("def _lock 加锁")
             return True
 
@@ -131,9 +127,14 @@ class EtcdWatch(Singleton):
         :param str key: 关键字
         :return:
         """
+        future = Future()
+        # 参数检查
+        if not key.startswith(self.watch_root) or key in self.wait_lock_dict or key in self.locked_dict:
+            future.set_result((False, None))
+            return future
+
         self._start_thread()
 
-        future = Future()
         self.watch_dict[key].append(future)
         return future
 
@@ -144,15 +145,20 @@ class EtcdWatch(Singleton):
         :param int ttl: 过期时间
         :return: Future object
         """
+        future = Future()
+        # 参数检查
+        if not key.startswith(self.watch_root) or key in self.watch_dict:
+            future.set_result((False, None))
+            return future
+
         self._start_thread()
 
-        future = Future()
         token = str(uuid.uuid4())
         lock_item = self.Lock_Item(future, token, ttl)
         lock_flag = self._lock(key, token, ttl)
         if lock_flag:
             self.locked_dict[key] = lock_item
-            future.set_result(token)
+            future.set_result((True, token))
         else:
             self.wait_lock_dict[key].append(lock_item)
         return future
@@ -165,7 +171,7 @@ class EtcdWatch(Singleton):
         """
         try:
             logging.error("解锁 start")
-            res = self.client.test_and_set(key, UNLOCK, token)
+            res = self.client.test_and_set(key, self.UNLOCK, token)
 
             logging.error(res)
             logging.error("解锁 %s", token)
@@ -178,7 +184,7 @@ class EtcdWatch(Singleton):
 
 if __name__ == "__main__":
     ETCD_SERVERS = (("127.0.0.1", 2379),)
-    etcd_watch = EtcdWatch("/watch", ETCD_SERVERS, None)
+    etcd_watch = EtcdWatchBase("/watch", ETCD_SERVERS, None)
 
 
     @gen.coroutine
