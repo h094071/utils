@@ -187,6 +187,27 @@ class EtcdWatchBase(Singleton):
             logging.error(e)
             return False
 
+    def start_loop(self, function_list):
+        """
+        仅供脚本使用
+        :param function_list:
+        :return:
+        """
+        io_loop = IOLoop.instance()
+        future_list = []
+
+        def stop(future):
+            future_list.remove(future)
+            if not future_list:
+                io_loop.stop()
+
+        for function in function_list:
+            future = function()
+            future_list.append(future)
+            io_loop.add_future(future, lambda x: stop(x))
+
+        io_loop.start()
+
 
 if __name__ == "__main__":
     ETCD_SERVERS = (("127.0.0.1", 2379),)
@@ -222,23 +243,7 @@ if __name__ == "__main__":
         raise gen.Return(res)
 
 
-    io_loop = IOLoop.instance()
-    future_list = []
-    for i in range(10):
-        future = test()
-        future_list.append(future)
-
-
-        def stop(future):
-            future_list.remove(future)
-
-            if not future_list:
-                io_loop.stop()
-
-
-        io_loop.add_future(future, lambda x: stop(x))
-    io_loop.start()
-
+    etcd_watch.start_loop([test, test, test, test, test, test, test])
 
     # IOLoop.current().run_sync(test)
     # def main():
