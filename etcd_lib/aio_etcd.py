@@ -128,6 +128,10 @@ class ProcessBase(Singleton):
         key = self.get_key(key)
         return self.client.write(key, value, ttl, dir, append, **kwdargs)
 
+    def get(self, key, **kwdargs):
+        key = self.get_key(key)
+        return self.client.read(key, **kwdargs)
+
     def process(self, etcd_value):
         """
 
@@ -196,7 +200,7 @@ class LockProcess(ProcessBase):
         :param etcd_servers:
         :param sentry:
         """
-        self.base_key = "watch"
+        self.base_key = "lock"
         self.wait_lock_dict = defaultdict(list)
         self.locking_dict = dict()
         super(LockProcess, self).__init__(watch_root, etcd_servers, sentry)
@@ -216,7 +220,7 @@ class LockProcess(ProcessBase):
         if etcd_value in (self.UNLOCK, None) and wait_lock_list:
             lock_item = wait_lock_list[0]
             logging.error("watch lock")
-            lock_flag = self._lock(etcd_key, lock_item.token, lock_item.ttl)
+            lock_flag = self._lock(etcd_key, lock_item)
             if lock_flag:
                 lock_item.future.set_result((True, lock_item.token))
                 self.locking_dict[etcd_key] = lock_item
@@ -229,15 +233,16 @@ class LockProcess(ProcessBase):
                 del self.locking_dict[etcd_key]
                 raise RuntimeError("key: %s ttl: %s，锁超时" % (etcd_key, ttl))
 
-    def _lock(self, key, token, ttl):
+    def _lock(self, key, lock_item):
         """
 
         :param str key: 关键字
         :param str lock_uuid: lock码
         :return: bool
         """
+        token = lock_item.token
+        ttl = lock_item.ttl
         try:
-
             self.test_and_set(key, token, self.UNLOCK, ttl)
             return True
 
@@ -265,7 +270,7 @@ class LockProcess(ProcessBase):
 
         token = uuid.uuid4().hex
         lock_item = self.Lock_Item(future, token, ttl)
-        lock_flag = self._lock(key, token, ttl)
+        lock_flag = self._lock(key, lock_item)
         if lock_flag:
             self.locking_dict[key] = lock_item
             future.set_result((True, token))
