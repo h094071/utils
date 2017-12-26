@@ -240,8 +240,8 @@ if __name__ == "__main__":
         raise gen.Return(res)
 
 
-    # etcd_watch.start_loop([test, test, test, test, test, test, test])
-    IOLoop.current().run_sync(test)
+    etcd_watch.start_loop([test, test, test, test, test, test, test])
+    # IOLoop.current().run_sync(test)
 
     # IOLoop.current().run_sync(test)
     # def main():
