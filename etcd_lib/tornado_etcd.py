@@ -3,12 +3,8 @@
 """
 etcd 异步 服务发现 异步 锁
 """
-import os
-import sys
 import uuid
 from collections import namedtuple, defaultdict
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 import etcd
 import threading
 import logging
@@ -47,9 +43,7 @@ class EtcdProcess(object):
                 self._local_index = response.modifiedIndex + 1
 
                 etcd_key = response.key
-
                 dir_list = etcd_key.split("/")
-
                 process_dir = dir_list[2]
 
                 if self.key_process_dict.get(process_dir):
@@ -103,7 +97,7 @@ class ProcessBase(Singleton):
         self.watch_dict = defaultdict(list)
         self.etcd_process.register(self.base_key, self.process)
 
-    def get_key(self, key):
+    def get_full_key(self, key):
         """
         获得带路径的key值 eg: key = "read_lock" return /base_dir/lock/read_lock
         :param str key: 部分key值
@@ -122,7 +116,7 @@ class ProcessBase(Singleton):
         :param ttl: 过期时间
         :return:
         """
-        key = self.get_key(key)
+        key = self.get_full_key(key)
         return self.client.test_and_set(key, value, prev_value, ttl)
 
     def set(self, key, value, ttl=None, dir=False, append=False, **kwdargs):
@@ -136,7 +130,7 @@ class ProcessBase(Singleton):
         :param kwdargs: 
         :return: 
         """
-        key = self.get_key(key)
+        key = self.get_full_key(key)
         return self.client.write(key, value, ttl, dir, append, **kwdargs)
 
     def get(self, key, **kwdargs):
@@ -146,7 +140,7 @@ class ProcessBase(Singleton):
         :param kwdargs: 
         :return: 
         """
-        key = self.get_key(key)
+        key = self.get_full_key(key)
         return self.client.read(key, **kwdargs)
 
     def process(self, etcd_value):
@@ -203,6 +197,50 @@ class WatchProcess(ProcessBase):
             del self.watch_dict[etcd_key]
 
 
+class EternalWatchProcess(ProcessBase):
+    """
+    监控关键字，关键字不变化，协程阻塞，关键字有变化，协程继续执行
+    """
+
+    def __init__(self, watch_root, etcd_servers, sentry=None):
+        """
+        init
+        :param key:
+        :param etcd_servers:
+        :param sentry:
+        """
+        self.base_key = "eternal_watch"
+        super(EternalWatchProcess, self).__init__(watch_root, etcd_servers, sentry)
+
+    def get_key(self, key):
+        """
+        监控关键字，关键字不变化，协程阻塞，关键字有变化，协程继续执行
+        :param str key: 监控的关键字
+        :return:
+        """
+        self.etcd_process._start_thread()
+
+        if not self.watch_dict.get(key):
+            # etcd 中必须提前设置该key，否则报错
+            etcd_res = self.get(key)
+            self.watch_dict[key] = etcd_res.value
+
+        return self.watch_dict[key]
+
+    def process(self, etcd_res):
+        """
+        监控关键字处理器
+        :param etcd_res:
+        :return:
+        """
+        etcd_key = etcd_res.dir_list[0]
+        etcd_value = etcd_res.value
+
+        if etcd_key in self.watch_dict.keys():
+            # 更新值
+            self.watch_dict[etcd_key] = etcd_value
+
+
 class LockProcess(ProcessBase):
     """
     锁
@@ -239,7 +277,7 @@ class LockProcess(ProcessBase):
             lock_flag = self._lock(etcd_key, lock_item)
 
             if lock_flag:
-                logging.info("tornado etcd 加锁成功 key:%s", etcd_key)
+                logging.info("tornado etcd lock sucess key:%s", etcd_key)
                 lock_item.future.set_result((True, lock_item.token))
                 self.locking_dict[etcd_key] = lock_item
                 self.wait_lock_dict[etcd_key].pop(0)
@@ -249,7 +287,7 @@ class LockProcess(ProcessBase):
             if self.locking_dict.get(etcd_key):
                 ttl = self.locking_dict[etcd_key].ttl
                 del self.locking_dict[etcd_key]
-                raise RuntimeError("key: %s ttl: %s，锁超时" % (etcd_key, ttl))
+                raise RuntimeError("key: %s ttl: %s，lock time out" % (etcd_key, ttl))
 
     def _lock(self, key, lock_item):
         """
@@ -304,10 +342,10 @@ class LockProcess(ProcessBase):
         """
         try:
             self.test_and_set(key, self.UNLOCK, token)
-            logging.info("tornado etcd 解锁 key: %s, token: %s", key, token)
+            logging.info("tornado etcd unlock key: %s, token: %s", key, token)
             return True
         except (etcd.EtcdCompareFailed, etcd.EtcdKeyNotFound) as e:
-            logging.error("在未加锁的情况下，进行解锁操作 %s", e)
+            logging.error("tornado etcd unlock before lock %s", e)
             return False
 
 
